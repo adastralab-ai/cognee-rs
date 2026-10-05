@@ -495,3 +495,59 @@ async fn test_memify_with_type_and_names_filter_and() {
         1
     );
 }
+
+/// SDK-708: custom triplets whose relation differs only in spelling share one
+/// point id, so memify must fold them before indexing — and pick the same
+/// survivor (smallest `text`, here the `"Works At"` spelling) whatever order the caller supplied them in.
+#[tokio::test]
+async fn test_memify_custom_triplets_fold_spelling_variants_deterministically() {
+    let rows = [
+        json!({"source_node": "Alice", "relationship_name": "works at", "target_node": "TechCorp"}),
+        json!({"source_node": "Alice", "relationship_name": "Works At", "target_node": "TechCorp"}),
+        json!({"source_node": "Alice", "relationship_name": "knows", "target_node": "Bob"}),
+    ];
+    let expected_id = cognee_models::Triplet::new(
+        Entity::id_for("Alice"),
+        Entity::id_for("TechCorp"),
+        "works at".to_string(),
+        String::new(),
+    )
+    .id;
+
+    for order in [vec![0, 1, 2], vec![1, 0, 2], vec![2, 1, 0]] {
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(MockGraphDB::new());
+        let mock = Arc::new(MockVectorDB::new());
+        let vector_db: Arc<dyn VectorDB> = Arc::clone(&mock) as Arc<dyn VectorDB>;
+        let engine: Arc<dyn EmbeddingEngine> = Arc::new(MockEmbeddingEngine::new(8));
+        let (pool, database) = make_ctx_handles().await;
+        let config = MemifyConfig::default()
+            .with_custom_data(order.iter().map(|&i| rows[i].clone()).collect());
+
+        let result = memify(
+            graph_db,
+            vector_db,
+            engine,
+            pool,
+            database,
+            Arc::new(cognee_database::NoopPipelineRunRepository::new())
+                as Arc<dyn cognee_database::PipelineRunRepository>,
+            Some(Uuid::new_v4()),
+            Some(Uuid::new_v4()),
+            None,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.triplet_count, 2, "order {order:?}");
+        assert_eq!(result.index_result.indexed_count, 2, "order {order:?}");
+        let payload = mock
+            .get_payload("Triplet", "text", expected_id)
+            .expect("folded triplet is indexed");
+        assert_eq!(
+            payload.get("relationship").and_then(|v| v.as_str()),
+            Some("Works At"),
+            "order {order:?}"
+        );
+    }
+}

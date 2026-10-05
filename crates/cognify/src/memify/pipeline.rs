@@ -297,6 +297,11 @@ pub async fn memify(
                         .with_names(source, target),
                 );
             }
+            // Two custom triplets whose relation differs only in spelling
+            // (`"works at"` / `"Works At"`) hash to one id, so they need the
+            // same producer-side fold as the graph-extraction path — see
+            // [`crate::triplet_creation::fold_triplets_by_id`].
+            let custom_triplets = crate::triplet_creation::fold_triplets_by_id(custom_triplets);
             info!(
                 "Using {} custom triplets instead of graph extraction",
                 custom_triplets.len()
