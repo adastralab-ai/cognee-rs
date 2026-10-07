@@ -16,8 +16,11 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sea_orm::sea_query::{Alias, Cond, Expr, Iden, OnConflict, Query};
-use sea_orm::{ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Statement};
+use sea_orm::sea_query::{Alias, Cond, Expr, Iden, Query};
+use sea_orm::{
+    ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, DbErr,
+    ExecResult, QueryResult, Statement, TransactionTrait,
+};
 use sea_orm_migration::MigratorTrait;
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -28,12 +31,91 @@ use tracing::debug;
 use cognee_utils::sanitize::{sanitize_json, sanitize_str, sanitize_string};
 
 use crate::error::{GraphDBError, GraphDBResult};
-use crate::traits::GraphDBTrait;
+use crate::traits::{GraphDBTrait, NeighborhoodScope, apply_neighborhood_scope};
 use crate::types::{EdgeData, GraphNode, NodeData, parse_audit_timestamp};
 
-/// Max rows per INSERT batch (6 params per node row, 6 per edge row → 600 params at 100 rows,
-/// well within PostgreSQL's limit). Matches `PgVectorAdapter::BATCH_SIZE`.
-const BATCH_SIZE: usize = 100;
+/// Rows per bulk upsert statement. Columns bind as one array parameter each,
+/// so this is bounded only by statement memory, not by PostgreSQL's 65 535
+/// bind-parameter limit.
+const WRITE_BATCH: usize = 5000;
+
+/// Ids per `= ANY($1::text[])` array parameter on the read/delete paths.
+const ID_BATCH: usize = 20_000;
+
+/// `plan_cache_mode = force_custom_plan`, as a `SET LOCAL`.
+///
+/// The `SET LOCAL` twin of the connection option [`PgGraphAdapter::new`] puts on
+/// the pool it opens itself; that constructor's comment carries the measurement
+/// (1.2 ms custom vs 10.9 ms generic for a 5-entity `get_neighborhood` on a 10k
+/// store, the generic plan having fallen back to a sequential scan of
+/// `graph_edge`). This is the form [`PgGraphAdapter::from_connection`] has to
+/// use, because the pool is the caller's — in the single-shared-Postgres layout
+/// it is the relational store's — so its `ConnectOptions` are not ours to
+/// change. Keep the two in step.
+///
+/// `plan_cache_mode` is core Postgres (12+) and needs no version gate, unlike
+/// the `hnsw.*` settings the vector adapter carries the same way. It is not what
+/// sets this adapter's floor, though — the `GraphAutovacuum` migration does, at
+/// 13; see its own note.
+const PLAN_CACHE_LOCAL: &str = "SET LOCAL plan_cache_mode = force_custom_plan";
+
+/// Nodes of the materialized id-set CTE `ids` plus the edges induced on it:
+/// each id's outgoing edges through the source-side index (a `LATERAL`
+/// subquery, fenced with `OFFSET 0`, so it is always a per-id index probe),
+/// kept when the target is in the set. Rows are discriminated by `kind`; see
+/// [`PgGraphAdapter::subgraph_query`].
+///
+/// The plain `ids JOIN graph_edge JOIN ids` form leaves the choice to the
+/// planner, which cannot estimate a materialized CTE's size well and picked
+/// a sequential scan of `graph_edge` plus hash joins for a 10-seed
+/// neighbourhood (88 ids): 3.3-3.9 ms vs 1.8-2.1 ms for this form on a 10k
+/// store, and the scan grows with the whole edge table.
+const INDUCED_SUBGRAPH: &str = "\
+    SELECT 'node' AS kind, n.id, n.name, n.type, n.properties, \
+           NULL::text AS source_id, NULL::text AS target_id, \
+           NULL::text AS relationship_name, NULL::jsonb AS edge_properties \
+    FROM ids CROSS JOIN LATERAL \
+         (SELECT x.id, x.name, x.type, x.properties FROM graph_node x \
+          WHERE x.id = ids.id OFFSET 0) n \
+    UNION ALL \
+    SELECT 'edge', NULL, NULL, NULL, NULL, \
+           e.source_id, e.target_id, e.relationship_name, e.properties \
+    FROM ids a CROSS JOIN LATERAL \
+         (SELECT * FROM graph_edge x WHERE x.source_id = a.id OFFSET 0) e \
+    WHERE e.target_id IN (SELECT id FROM ids)";
+
+/// The node half is a per-id primary-key probe (`LATERAL`, fenced with
+/// `OFFSET 0`) in both forms: as a plain join the planner, unable to size the
+/// materialized id set, priced the probes as random IO and hashed all of
+/// `graph_node` instead — a 2 GB temp-file spill per 24 triplet queries at
+/// 100k, 143 ms per call against ~30 ms for nested probes.
+///
+/// [`INDUCED_SUBGRAPH`] with the edge half as two `IN (SELECT id FROM ids)`
+/// semi-joins. For large id sets (hundreds of seeds, thousands of ids) the
+/// explicit double join plans as a merge join that spends most of its time
+/// sorting edge rows by `target_id` under the database collation; hashed
+/// semi-joins avoid the sort. For a handful of seeds it is slower than the
+/// join form, hence both.
+const INDUCED_SUBGRAPH_SEMI: &str = "\
+    SELECT 'node' AS kind, n.id, n.name, n.type, n.properties, \
+           NULL::text AS source_id, NULL::text AS target_id, \
+           NULL::text AS relationship_name, NULL::jsonb AS edge_properties \
+    FROM ids CROSS JOIN LATERAL \
+         (SELECT x.id, x.name, x.type, x.properties FROM graph_node x \
+          WHERE x.id = ids.id OFFSET 0) n \
+    UNION ALL \
+    SELECT 'edge', NULL, NULL, NULL, NULL, \
+           e.source_id, e.target_id, e.relationship_name, e.properties \
+    FROM graph_edge e \
+    WHERE e.source_id IN (SELECT id FROM ids) AND e.target_id IN (SELECT id FROM ids)";
+
+/// A bulk write of at least this many rows into a graph table that has never
+/// been analysed runs `ANALYZE` on it (see
+/// [`PgGraphAdapter::analyze_if_never_analyzed`]).
+const ANALYZE_MIN_ROWS: usize = 1000;
+
+/// Id-set size from which `get_neighborhood` uses [`INDUCED_SUBGRAPH_SEMI`].
+const SEMI_JOIN_MIN_SEEDS: usize = 64;
 
 /// Only these column names may appear in dynamic WHERE clauses to prevent SQL injection.
 const ALLOWED_FILTER_ATTRS: &[&str] = &["id", "name", "type"];
@@ -49,8 +131,6 @@ enum GNode {
     Name,
     Type,
     Properties,
-    CreatedAt,
-    UpdatedAt,
 }
 
 impl Iden for GNode {
@@ -68,8 +148,6 @@ impl Iden for GNode {
                 Self::Name => "name",
                 Self::Type => "type",
                 Self::Properties => "properties",
-                Self::CreatedAt => "created_at",
-                Self::UpdatedAt => "updated_at",
             }
         )
         .expect("write to string cannot fail");
@@ -83,8 +161,6 @@ enum GEdge {
     TargetId,
     RelationshipName,
     Properties,
-    CreatedAt,
-    UpdatedAt,
 }
 
 impl Iden for GEdge {
@@ -102,8 +178,6 @@ impl Iden for GEdge {
                 Self::TargetId => "target_id",
                 Self::RelationshipName => "relationship_name",
                 Self::Properties => "properties",
-                Self::CreatedAt => "created_at",
-                Self::UpdatedAt => "updated_at",
             }
         )
         .expect("write to string cannot fail");
@@ -184,6 +258,14 @@ pub struct PgGraphAdapter {
     /// failing with a closed pool. Neither in-tree factory takes that path today,
     /// but both constructors are public API.
     owns_pool: bool,
+    /// Whether every pooled connection was opened with [`Self::new`]'s session
+    /// options — today just `plan_cache_mode = force_custom_plan`.
+    ///
+    /// `false` for [`Self::from_connection`], where the parameterised
+    /// statements carry the same setting themselves as a `SET LOCAL` (see
+    /// [`Self::tuned_locals`]), so an adapter answers and plans the same
+    /// whichever constructor built it — only the round trip differs.
+    tuned_sessions: bool,
 }
 
 impl PgGraphAdapter {
@@ -192,7 +274,20 @@ impl PgGraphAdapter {
     /// The database must already exist. Use [`Self::from_connection`] to share
     /// a connection that was established elsewhere (e.g. by the database crate).
     pub async fn new(database_url: &str) -> GraphDBResult<Self> {
-        let db = Database::connect(database_url)
+        // Custom plans for every statement on this adapter's own pool. The
+        // graph reads bind their id sets as one `text[]`, and sqlx caches each
+        // prepared statement per connection; after five executions Postgres
+        // may switch it to a generic plan, which cannot see the array's size
+        // and so costs a 5-seed neighbourhood like any other. Measured on a
+        // 10k store: the hybrid lane's 5-entity `get_neighborhood` ran 1.2 ms
+        // with a custom plan and 10.9 ms with the generic one (a sequential
+        // scan of `graph_edge` for the induced edges). Planning these
+        // statements costs well under a millisecond.
+        let mut opts = ConnectOptions::new(database_url.to_string());
+        opts.map_sqlx_postgres_opts(|o| {
+            o.options([("plan_cache_mode", "force_custom_plan".to_string())])
+        });
+        let db = Database::connect(opts)
             .await
             .map_err(|e| GraphDBError::ConnectionError(format!("PgGraph connect failed: {e}")))?;
 
@@ -205,12 +300,21 @@ impl PgGraphAdapter {
         Ok(Self {
             db,
             owns_pool: true,
+            tuned_sessions: true,
         })
     }
 
     /// Wrap an existing SeaORM `DatabaseConnection` (must be Postgres).
     ///
     /// Only the graph tables are created if missing (via migration).
+    ///
+    /// The session tuning [`Self::new`] puts in its pool's connection options
+    /// cannot be applied here — the pool is the caller's, and in the
+    /// single-shared-Postgres layout that caller is the relational store — so
+    /// the parameterised statements carry it per statement instead
+    /// (`tuned_sessions: false`; see [`Self::tuned_locals`]). This is the
+    /// constructor that layout actually uses, so it is the one where the
+    /// generic-plan cliff `new()` measures would otherwise be hit.
     pub async fn from_connection(db: DatabaseConnection) -> GraphDBResult<Self> {
         cleanup_legacy_seaql_migrations(&db).await?;
         migrator::Migrator::up(&db, None).await.map_err(|e| {
@@ -220,6 +324,7 @@ impl PgGraphAdapter {
         Ok(Self {
             db,
             owns_pool: false,
+            tuned_sessions: false,
         })
     }
 
@@ -288,6 +393,102 @@ impl PgGraphAdapter {
         &self.db
     }
     // -- helpers -------------------------------------------------------------
+
+    /// `ANALYZE table` if it has never been analysed (`reltuples = -1`).
+    ///
+    /// Autovacuum analyses a table only after its naptime (60 s) and once
+    /// enough rows changed, so a store searched right after its first
+    /// cognify — every 10k-tier run here — plans the neighbourhood reads
+    /// with no statistics at all: hash joins over guessed sizes, 9.4 ms per
+    /// hybrid entity neighbourhood against 0.8 ms once analysed. One cheap
+    /// catalog probe per bulk write; failures are logged (the write already
+    /// succeeded).
+    async fn analyze_if_never_analyzed(&self, table: &str) {
+        let probe = self
+            .db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "SELECT (reltuples < 0) AS never FROM pg_class WHERE oid = '{table}'::regclass"
+                ),
+            ))
+            .await;
+        let never =
+            matches!(probe, Ok(Some(ref r)) if r.try_get::<bool>("", "never").unwrap_or(false));
+        if never
+            && let Err(e) = self
+                .db
+                .execute_unprepared(&format!("ANALYZE {table}"))
+                .await
+        {
+            debug!("ANALYZE {table} failed: {e}");
+        }
+    }
+
+    /// The `SET LOCAL` a statement has to carry on a connection this adapter
+    /// did not open, or `None` on one of its own pools.
+    ///
+    /// Applied to the **parameterised** statements only, and that is the whole
+    /// scope of the setting: a generic plan can differ from a custom one only
+    /// where there is a parameter to be costed blind. The unparameterised
+    /// statements here — the `count(*)`s, `is_empty`, `get_graph_data`,
+    /// `get_all_relationship_names`, the `reltuples` probe — plan identically
+    /// either way, so wrapping them would buy a transaction and a round trip
+    /// for nothing. `ANALYZE` could not take it at all: it cannot run inside a
+    /// transaction block.
+    ///
+    /// A plain `SET` would be worse than nothing: it outlives the statement and
+    /// leaks to whatever borrows that pooled connection next, which on a
+    /// caller-owned pool is the relational store's own queries.
+    ///
+    /// Pure in `tuned_sessions` so the decision is testable without a server.
+    fn tuned_locals(tuned_sessions: bool) -> Option<&'static str> {
+        (!tuned_sessions).then_some(PLAN_CACHE_LOCAL)
+    }
+
+    /// [`ConnectionTrait::query_all`] with [`Self::tuned_locals`] applied, in
+    /// the transaction that makes a `SET LOCAL` mean anything — outside one it
+    /// is a no-op with a warning — and that scopes it to this statement so it
+    /// cannot leak to the next borrower of a pooled connection.
+    ///
+    /// One plain statement on this adapter's own pools, where the connection
+    /// options already carry the setting.
+    async fn query_all_tuned(&self, stmt: Statement) -> Result<Vec<QueryResult>, DbErr> {
+        let Some(locals) = Self::tuned_locals(self.tuned_sessions) else {
+            return self.db.query_all(stmt).await;
+        };
+        let txn = self.db.begin().await?;
+        txn.execute_unprepared(locals).await?;
+        let rows = txn.query_all(stmt).await?;
+        txn.commit().await?;
+        Ok(rows)
+    }
+
+    /// [`Self::query_all_tuned`] for a single-row read.
+    async fn query_one_tuned(&self, stmt: Statement) -> Result<Option<QueryResult>, DbErr> {
+        let Some(locals) = Self::tuned_locals(self.tuned_sessions) else {
+            return self.db.query_one(stmt).await;
+        };
+        let txn = self.db.begin().await?;
+        txn.execute_unprepared(locals).await?;
+        let row = txn.query_one(stmt).await?;
+        txn.commit().await?;
+        Ok(row)
+    }
+
+    /// [`Self::query_all_tuned`] for a write. The write paths need it too: a
+    /// `DELETE … WHERE id = ANY($1::text[])` costed without the array is the
+    /// same sequential scan the read paths fall into.
+    async fn execute_tuned(&self, stmt: Statement) -> Result<ExecResult, DbErr> {
+        let Some(locals) = Self::tuned_locals(self.tuned_sessions) else {
+            return self.db.execute(stmt).await;
+        };
+        let txn = self.db.begin().await?;
+        txn.execute_unprepared(locals).await?;
+        let out = txn.execute(stmt).await?;
+        txn.commit().await?;
+        Ok(out)
+    }
 
     /// Build a SeaORM [`Statement`] from a `sea_query` query.
     fn build<S: sea_orm::StatementBuilder>(&self, query: &S) -> Statement {
@@ -389,6 +590,69 @@ impl PgGraphAdapter {
             }
         }
         Ok(data)
+    }
+
+    /// Run a node query (`id, name, type, properties`) and key each row by id.
+    async fn graph_nodes_where(
+        &self,
+        sql: &str,
+        values: Vec<sea_orm::Value>,
+    ) -> GraphDBResult<Vec<GraphNode>> {
+        let rows = self
+            .query_all_tuned(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                values,
+            ))
+            .await
+            .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
+        rows.iter().map(Self::parse_graph_node).collect()
+    }
+
+    /// [`Self::parse_node_row`], keyed by the node's id.
+    fn parse_graph_node(row: &sea_orm::QueryResult) -> GraphDBResult<GraphNode> {
+        let data = Self::parse_node_row(row)?;
+        let id = data
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Ok((id, data))
+    }
+
+    /// Run a `kind`-discriminated node/edge union (`'node'` rows carry
+    /// `id, name, type, properties`; edge rows `source_id, target_id,
+    /// relationship_name, edge_properties`) and split it.
+    async fn subgraph_query(
+        &self,
+        sql: &str,
+        values: Vec<sea_orm::Value>,
+    ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+        let rows = self
+            .query_all_tuned(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                values,
+            ))
+            .await
+            .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        for row in &rows {
+            let kind: String = row.try_get("", "kind").unwrap_or_default();
+            if kind == "node" {
+                nodes.push(Self::parse_graph_node(row)?);
+            } else {
+                edges.push(Self::parse_edge_row_cols(
+                    row,
+                    "source_id",
+                    "target_id",
+                    "relationship_name",
+                    "edge_properties",
+                )?);
+            }
+        }
+        Ok((nodes, edges))
     }
 
     /// Parse an edge row into [`EdgeData`].
@@ -494,8 +758,7 @@ impl GraphDBTrait for PgGraphAdapter {
             .to_owned();
 
         let row = self
-            .db
-            .query_one(self.build(&query))
+            .query_one_tuned(self.build(&query))
             .await
             .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
 
@@ -519,49 +782,60 @@ impl GraphDBTrait for PgGraphAdapter {
             return Ok(());
         }
 
-        // Serialize and deduplicate by id (last wins).
-        let mut seen: HashMap<String, NodeRow> = HashMap::new();
+        // Serialize and deduplicate by id (last wins), keeping first-seen order.
+        let mut order: Vec<String> = Vec::with_capacity(nodes.len());
+        let mut seen: HashMap<String, NodeRow> = HashMap::with_capacity(nodes.len());
         for node in &nodes {
             let row = Self::serialize_node_to_row(node)?;
+            if !seen.contains_key(&row.id) {
+                order.push(row.id.clone());
+            }
             seen.insert(row.id.clone(), row);
         }
-        let rows: Vec<NodeRow> = seen.into_values().collect();
 
-        for chunk in rows.chunks(BATCH_SIZE) {
-            let mut insert = Query::insert()
-                .into_table(GNode::Table)
-                .columns([
-                    GNode::Id,
-                    GNode::Name,
-                    GNode::Type,
-                    GNode::Properties,
-                    GNode::CreatedAt,
-                    GNode::UpdatedAt,
-                ])
-                .to_owned();
-
-            for row in chunk {
-                insert.values_panic([
-                    row.id.clone().into(),
-                    row.name.clone().into(),
-                    row.node_type.clone().into(),
-                    row.properties.clone().into(),
-                    row.created_at.into(),
-                    row.updated_at.into(),
-                ]);
+        // One `INSERT … SELECT FROM unnest(…)` per `WRITE_BATCH` rows: every
+        // column travels as a single array parameter, so the statement text
+        // (and its cached prepared plan) is the same for every batch, and a
+        // batch costs one round trip instead of `rows / 100`.
+        for chunk in order.chunks(WRITE_BATCH) {
+            let mut ids = Vec::with_capacity(chunk.len());
+            let mut names = Vec::with_capacity(chunk.len());
+            let mut types = Vec::with_capacity(chunk.len());
+            let mut props = Vec::with_capacity(chunk.len());
+            let mut created = Vec::with_capacity(chunk.len());
+            let mut updated = Vec::with_capacity(chunk.len());
+            for id in chunk {
+                let Some(row) = seen.remove(id) else {
+                    continue;
+                };
+                ids.push(row.id);
+                names.push(row.name);
+                types.push(row.node_type);
+                props.push(row.properties);
+                created.push(row.created_at.to_rfc3339());
+                updated.push(row.updated_at.to_rfc3339());
             }
-
-            insert.on_conflict(
-                OnConflict::column(GNode::Id)
-                    .update_columns([GNode::Name, GNode::Type, GNode::Properties])
-                    .value(GNode::UpdatedAt, Expr::current_timestamp())
-                    .to_owned(),
-            );
-
-            self.db
-                .execute(self.build(&insert))
-                .await
-                .map_err(|e| GraphDBError::NodeError(format!("Failed to upsert nodes: {e}")))?;
+            self.execute_tuned(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "INSERT INTO graph_node (id, name, type, properties, created_at, updated_at) \
+                     SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::jsonb[], \
+                                          $5::text[]::timestamptz[], $6::text[]::timestamptz[]) \
+                     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, type = EXCLUDED.type, \
+                       properties = EXCLUDED.properties, updated_at = CURRENT_TIMESTAMP",
+                [
+                    sea_orm::Value::from(ids),
+                    sea_orm::Value::from(names),
+                    sea_orm::Value::from(types),
+                    sea_orm::Value::from(props),
+                    sea_orm::Value::from(created),
+                    sea_orm::Value::from(updated),
+                ],
+            ))
+            .await
+            .map_err(|e| GraphDBError::NodeError(format!("Failed to upsert nodes: {e}")))?;
+        }
+        if order.len() >= ANALYZE_MIN_ROWS {
+            self.analyze_if_never_analyzed("graph_node").await;
         }
 
         Ok(())
@@ -573,27 +847,25 @@ impl GraphDBTrait for PgGraphAdapter {
             .and_where(Expr::col(GNode::Id).eq(node_id))
             .to_owned();
 
-        self.db
-            .execute(self.build(&query))
+        self.execute_tuned(self.build(&query))
             .await
             .map_err(|e| GraphDBError::NodeError(format!("Failed to delete node: {e}")))?;
         Ok(())
     }
 
     async fn delete_nodes(&self, node_ids: &[String]) -> GraphDBResult<()> {
-        if node_ids.is_empty() {
-            return Ok(());
-        }
-
-        let query = Query::delete()
-            .from_table(GNode::Table)
-            .and_where(Expr::col(GNode::Id).is_in(node_ids.iter().map(|s| s.as_str())))
-            .to_owned();
-
-        self.db
-            .execute(self.build(&query))
+        // One `= ANY($1)` array parameter per `ID_BATCH` ids: a constant
+        // statement text, and no ceiling at PostgreSQL's 65 535 bind
+        // parameters (the per-id `IN ($1, …)` list failed past it).
+        for chunk in node_ids.chunks(ID_BATCH) {
+            self.execute_tuned(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "DELETE FROM graph_node WHERE id = ANY($1::text[])",
+                [chunk.to_vec().into()],
+            ))
             .await
             .map_err(|e| GraphDBError::NodeError(format!("Failed to delete nodes: {e}")))?;
+        }
         Ok(())
     }
 
@@ -605,8 +877,7 @@ impl GraphDBTrait for PgGraphAdapter {
             .to_owned();
 
         let row = self
-            .db
-            .query_one(self.build(&query))
+            .query_one_tuned(self.build(&query))
             .await
             .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
 
@@ -617,23 +888,22 @@ impl GraphDBTrait for PgGraphAdapter {
     }
 
     async fn get_nodes(&self, node_ids: &[String]) -> GraphDBResult<Vec<NodeData>> {
-        if node_ids.is_empty() {
-            return Ok(vec![]);
+        // Array parameter per `ID_BATCH` ids, as in `delete_nodes`.
+        let mut out = Vec::with_capacity(node_ids.len());
+        for chunk in node_ids.chunks(ID_BATCH) {
+            let rows = self
+                .query_all_tuned(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT id, name, type, properties FROM graph_node WHERE id = ANY($1::text[])",
+                    [chunk.to_vec().into()],
+                ))
+                .await
+                .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
+            for row in &rows {
+                out.push(Self::parse_node_row(row)?);
+            }
         }
-
-        let query = Query::select()
-            .columns([GNode::Id, GNode::Name, GNode::Type, GNode::Properties])
-            .from(GNode::Table)
-            .and_where(Expr::col(GNode::Id).is_in(node_ids.iter().map(|s| s.as_str())))
-            .to_owned();
-
-        let rows = self
-            .db
-            .query_all(self.build(&query))
-            .await
-            .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
-
-        rows.iter().map(Self::parse_node_row).collect()
+        Ok(out)
     }
 
     async fn get_node_truth_state(
@@ -848,8 +1118,7 @@ impl GraphDBTrait for PgGraphAdapter {
             .to_owned();
 
         let row = self
-            .db
-            .query_one(self.build(&query))
+            .query_one_tuned(self.build(&query))
             .await
             .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
 
@@ -893,8 +1162,7 @@ impl GraphDBTrait for PgGraphAdapter {
         let rels: Vec<_> = keys.iter().map(|k| k.2.clone()).collect();
 
         let rows = self
-            .db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_tuned(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "SELECT v.s, v.t, v.r \
                  FROM unnest($1::text[], $2::text[], $3::text[]) AS v(s, t, r) \
@@ -973,8 +1241,7 @@ impl GraphDBTrait for PgGraphAdapter {
         let target_id = sanitize_str(target_id).into_owned();
         let relationship_name = sanitize_str(relationship_name).into_owned();
         let result = self
-            .db
-            .execute(Statement::from_sql_and_values(
+            .execute_tuned(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "UPDATE graph_edge \
                  SET properties = COALESCE(properties, '{}'::jsonb) || $4::jsonb, \
@@ -1030,8 +1297,7 @@ impl GraphDBTrait for PgGraphAdapter {
         let rels: Vec<String> = keys.iter().map(|k| k.2.clone()).collect();
 
         let rows = self
-            .db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_tuned(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "SELECT e.source_id AS s, e.target_id AS t, e.relationship_name AS r, \
                         e.properties -> 'feedback_weight' AS w \
@@ -1133,8 +1399,7 @@ impl GraphDBTrait for PgGraphAdapter {
         }
 
         let rows = self
-            .db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_tuned(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "UPDATE graph_edge e \
                  SET properties = COALESCE(e.properties, '{}'::jsonb) \
@@ -1205,65 +1470,63 @@ impl GraphDBTrait for PgGraphAdapter {
         // survivors: `to_value` + `sanitize_json` on an entry that the next
         // duplicate immediately overwrites is pure waste.
         type EdgeProps = HashMap<Cow<'static, str>, Value>;
-        let mut seen: HashMap<(String, String, String), &EdgeProps> = HashMap::new();
+        let mut order: Vec<(String, String, String)> = Vec::with_capacity(edges.len());
+        let mut seen: HashMap<(String, String, String), &EdgeProps> =
+            HashMap::with_capacity(edges.len());
         for edge in edges {
             let key = (
                 sanitize_str(&edge.0).into_owned(),
                 sanitize_str(&edge.1).into_owned(),
                 sanitize_str(&edge.2).into_owned(),
             );
-            seen.insert(key, &edge.3);
+            if seen.insert(key.clone(), &edge.3).is_none() {
+                order.push(key);
+            }
         }
-        let mut deduped: Vec<((String, String, String), Value)> = seen
-            .into_iter()
-            .map(|(key, props)| {
-                let props_json =
-                    serde_json::to_value(props).map_err(GraphDBError::SerializationError)?;
+
+        // One `INSERT … SELECT FROM unnest(…)` per `WRITE_BATCH` edges (see
+        // `add_nodes_raw`). All rows of a call share one `created_at`, as
+        // before.
+        let now = now.to_rfc3339();
+        for chunk in order.chunks_mut(WRITE_BATCH) {
+            let mut src = Vec::with_capacity(chunk.len());
+            let mut dst = Vec::with_capacity(chunk.len());
+            let mut rel = Vec::with_capacity(chunk.len());
+            let mut props = Vec::with_capacity(chunk.len());
+            for key in chunk.iter_mut() {
+                let Some(p) = seen.get(key) else {
+                    continue;
+                };
                 // Edge properties carry LLM-authored descriptions and, through
                 // them, source text — same NUL exposure as node properties.
-                Ok((key, sanitize_json(props_json)))
-            })
-            .collect::<GraphDBResult<_>>()?;
-
-        // `chunks_mut` + `mem::take` so each row's strings and JSON blob are
-        // *moved* into the statement. Cloning here would deep-copy every edge's
-        // property object, which is a measurable cost on a graph with tens of
-        // thousands of edges and buys nothing — `deduped` is not read again.
-        for chunk in deduped.chunks_mut(BATCH_SIZE) {
-            let mut insert = Query::insert()
-                .into_table(GEdge::Table)
-                .columns([
-                    GEdge::SourceId,
-                    GEdge::TargetId,
-                    GEdge::RelationshipName,
-                    GEdge::Properties,
-                    GEdge::CreatedAt,
-                    GEdge::UpdatedAt,
-                ])
-                .to_owned();
-
-            for ((source, target, relationship_name), props_json) in chunk.iter_mut() {
-                insert.values_panic([
-                    std::mem::take(source).into(),
-                    std::mem::take(target).into(),
-                    std::mem::take(relationship_name).into(),
-                    std::mem::take(props_json).into(),
-                    now.into(),
-                    now.into(),
-                ]);
+                let json = serde_json::to_value(p).map_err(GraphDBError::SerializationError)?;
+                props.push(sanitize_json(json));
+                src.push(std::mem::take(&mut key.0));
+                dst.push(std::mem::take(&mut key.1));
+                rel.push(std::mem::take(&mut key.2));
             }
-
-            insert.on_conflict(
-                OnConflict::columns([GEdge::SourceId, GEdge::TargetId, GEdge::RelationshipName])
-                    .update_column(GEdge::Properties)
-                    .value(GEdge::UpdatedAt, Expr::current_timestamp())
-                    .to_owned(),
-            );
-
-            self.db
-                .execute(self.build(&insert))
+            self
+                .execute_tuned(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "INSERT INTO graph_edge (source_id, target_id, relationship_name, properties, \
+                                             created_at, updated_at) \
+                     SELECT s, t, r, p, $5::timestamptz, $5::timestamptz \
+                     FROM unnest($1::text[], $2::text[], $3::text[], $4::jsonb[]) AS u(s, t, r, p) \
+                     ON CONFLICT (source_id, target_id, relationship_name) \
+                     DO UPDATE SET properties = EXCLUDED.properties, updated_at = CURRENT_TIMESTAMP",
+                    [
+                        sea_orm::Value::from(src),
+                        sea_orm::Value::from(dst),
+                        sea_orm::Value::from(rel),
+                        sea_orm::Value::from(props),
+                        sea_orm::Value::from(now.clone()),
+                    ],
+                ))
                 .await
                 .map_err(|e| GraphDBError::EdgeError(format!("Failed to upsert edges: {e}")))?;
+        }
+        if order.len() >= ANALYZE_MIN_ROWS {
+            self.analyze_if_never_analyzed("graph_edge").await;
         }
         Ok(())
     }
@@ -1285,8 +1548,7 @@ impl GraphDBTrait for PgGraphAdapter {
             .to_owned();
 
         let rows = self
-            .db
-            .query_all(self.build(&query))
+            .query_all_tuned(self.build(&query))
             .await
             .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
 
@@ -1300,17 +1562,14 @@ impl GraphDBTrait for PgGraphAdapter {
     // that sea_query's builder cannot express.
 
     async fn get_neighbors(&self, node_id: &str) -> GraphDBResult<Vec<NodeData>> {
+        // Two directed index probes unioned into the id set, instead of one
+        // `source_id = $1 OR target_id = $1` scan joined through a CASE.
         let rows = self
-            .db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_tuned(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "SELECT DISTINCT m.id, m.name, m.type, m.properties \
-                 FROM graph_edge e \
-                 JOIN graph_node m ON m.id = CASE \
-                     WHEN e.source_id = $1 THEN e.target_id \
-                     ELSE e.source_id \
-                 END \
-                 WHERE e.source_id = $1 OR e.target_id = $1",
+                "SELECT m.id, m.name, m.type, m.properties FROM graph_node m \
+                 WHERE m.id IN (SELECT target_id FROM graph_edge WHERE source_id = $1 \
+                                UNION SELECT source_id FROM graph_edge WHERE target_id = $1)",
                 [node_id.into()],
             ))
             .await
@@ -1324,8 +1583,7 @@ impl GraphDBTrait for PgGraphAdapter {
         node_id: &str,
     ) -> GraphDBResult<Vec<(NodeData, HashMap<Cow<'static, str>, Value>, NodeData)>> {
         let rows = self
-            .db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_tuned(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "SELECT \
                      n.id AS src_id, n.name AS src_name, n.type AS src_type, n.properties AS src_props, \
@@ -1488,34 +1746,14 @@ impl GraphDBTrait for PgGraphAdapter {
         metrics.insert(Cow::Borrowed("mean_degree"), json!(mean_degree));
         metrics.insert(Cow::Borrowed("edge_density"), json!(edge_density));
 
-        // Connected components via recursive CTE (raw SQL — not expressible in sea_query)
-        let comp_rows = self
-            .db
-            .query_all(Statement::from_string(
-                DatabaseBackend::Postgres,
-                "WITH RECURSIVE component AS ( \
-                     SELECT id AS node_id, id AS comp_root FROM graph_node \
-                     UNION \
-                     SELECT CASE WHEN e.source_id = c.node_id THEN e.target_id ELSE e.source_id END, \
-                            c.comp_root \
-                     FROM component c \
-                     JOIN graph_edge e ON e.source_id = c.node_id OR e.target_id = c.node_id \
-                 ), \
-                 node_comp AS ( \
-                     SELECT node_id, MIN(comp_root) AS comp_id FROM component GROUP BY node_id \
-                 ) \
-                 SELECT comp_id, count(*) AS sz FROM node_comp GROUP BY comp_id ORDER BY sz DESC"
-                    .to_string(),
-            ))
-            .await
-            .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
-
-        let component_sizes: Vec<Value> = comp_rows
-            .iter()
-            .filter_map(|r| {
-                let sz: i64 = r.try_get("", "sz").ok()?;
-                Some(json!(sz))
-            })
+        // Connected components by one streaming union-find pass over the
+        // node and edge keys (O(V + E)); the recursive CTE this replaces
+        // materialised every (node, reachable root) pair and did not finish
+        // within minutes on a 10k-node cognify graph.
+        let component_sizes: Vec<Value> = components::component_sizes(&self.db)
+            .await?
+            .into_iter()
+            .map(|size| json!(size))
             .collect();
         let num_components = component_sizes.len();
 
@@ -1552,17 +1790,10 @@ impl GraphDBTrait for PgGraphAdapter {
         &self,
         attribute_filters: &HashMap<Cow<'static, str>, Vec<Value>>,
     ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
-        if attribute_filters.is_empty() {
-            return self.get_graph_data().await;
-        }
-
-        // Build WHERE clause — only allow whitelisted attributes to prevent SQL injection.
-        // Raw SQL is used here because the CTE + UNION ALL pattern is not expressible
-        // via sea_query.
-        let mut where_parts = Vec::new();
+        // Only whitelisted attributes may be interpolated (SQL injection);
+        // each attribute's values bind as one `text[]`.
+        let mut clauses = Vec::new();
         let mut values: Vec<sea_orm::Value> = Vec::new();
-        let mut param_idx = 1u32;
-
         for (attr, filter_values) in attribute_filters {
             if filter_values.is_empty() {
                 continue;
@@ -1572,78 +1803,27 @@ impl GraphDBTrait for PgGraphAdapter {
                     "Invalid filter attribute: {attr:?}. Allowed: {ALLOWED_FILTER_ATTRS:?}"
                 )));
             }
-            let placeholders: Vec<String> = filter_values
+            let strings: Vec<String> = filter_values
                 .iter()
                 .map(|v| {
-                    let ph = format!("${param_idx}");
-                    param_idx += 1;
-                    let s = v
-                        .as_str()
+                    v.as_str()
                         .map(String::from)
-                        .unwrap_or_else(|| v.to_string());
-                    values.push(s.into());
-                    ph
+                        .unwrap_or_else(|| v.to_string())
                 })
                 .collect();
-            where_parts.push(format!("n.{attr} IN ({})", placeholders.join(", ")));
+            values.push(strings.into());
+            clauses.push(format!("n.{attr} = ANY(${}::text[])", values.len()));
         }
 
-        if where_parts.is_empty() {
+        if clauses.is_empty() {
             return self.get_graph_data().await;
         }
 
-        let where_clause = where_parts.join(" AND ");
         let sql = format!(
-            "WITH filtered_nodes AS ( \
-                 SELECT id, name, type, properties FROM graph_node n WHERE {where_clause} \
-             ) \
-             SELECT 'node' AS kind, fn.id, fn.name, fn.type, fn.properties, \
-                    NULL::text AS source_id, NULL::text AS target_id, \
-                    NULL::text AS relationship_name, NULL::jsonb AS edge_props \
-             FROM filtered_nodes fn \
-             UNION ALL \
-             SELECT 'edge', NULL, NULL, NULL, NULL, \
-                    e.source_id, e.target_id, e.relationship_name, e.properties \
-             FROM graph_edge e \
-             WHERE e.source_id IN (SELECT id FROM filtered_nodes) \
-               AND e.target_id IN (SELECT id FROM filtered_nodes)"
+            "WITH ids AS MATERIALIZED (SELECT n.id FROM graph_node n WHERE {}) {INDUCED_SUBGRAPH}",
+            clauses.join(" AND ")
         );
-
-        let rows = self
-            .db
-            .query_all(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                &sql,
-                values,
-            ))
-            .await
-            .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
-
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-
-        for row in &rows {
-            let kind: String = row.try_get("", "kind").unwrap_or_default();
-            if kind == "node" {
-                let data = Self::parse_node_row(row)?;
-                let id = data
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                nodes.push((id, data));
-            } else {
-                edges.push(Self::parse_edge_row_cols(
-                    row,
-                    "source_id",
-                    "target_id",
-                    "relationship_name",
-                    "edge_props",
-                )?);
-            }
-        }
-
-        Ok((nodes, edges))
+        self.subgraph_query(&sql, values).await
     }
 
     /// Narrow the node scan to rows that could carry `needle` as a type-ish
@@ -1694,8 +1874,7 @@ impl GraphDBTrait for PgGraphAdapter {
         );
 
         let rows = self
-            .db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_tuned(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 &sql,
                 [sea_orm::Value::from(needle.to_lowercase())],
@@ -1716,6 +1895,12 @@ impl GraphDBTrait for PgGraphAdapter {
         Ok(nodes)
     }
 
+    /// The primary nodes (`type` = `node_type`, `name` in `node_names`), their
+    /// neighbours — any neighbour for `"OR"`, otherwise only neighbours
+    /// adjacent to as many distinct primaries as there are requested names —
+    /// and the edges induced on that set. Driven through the edge indexes
+    /// instead of `OR`-ed `IN (subquery)` predicates that scan the whole edge
+    /// table.
     async fn get_nodeset_subgraph(
         &self,
         node_type: &str,
@@ -1725,112 +1910,32 @@ impl GraphDBTrait for PgGraphAdapter {
         if node_names.is_empty() {
             return Ok((vec![], vec![]));
         }
-
-        // Raw SQL — complex CTE with dynamic neighbor logic (OR vs AND).
-        let name_placeholders: Vec<String> = (0..node_names.len())
-            .map(|i| format!("${}", i + 2))
-            .collect();
-        let names_in = name_placeholders.join(", ");
-
-        let neighbor_cte = if node_name_filter_operator == "OR" {
-            "neighbor_ids AS ( \
-                 SELECT DISTINCT CASE \
-                     WHEN e.source_id IN (SELECT id FROM primary_nodes) \
-                     THEN e.target_id ELSE e.source_id \
-                 END AS id \
-                 FROM graph_edge e \
-                 WHERE e.source_id IN (SELECT id FROM primary_nodes) \
-                    OR e.target_id IN (SELECT id FROM primary_nodes) \
-             )"
-            .to_string()
+        // (neighbour, primary) per edge touching a primary node; an edge whose
+        // source is primary contributes its target, otherwise its source.
+        let touching = "touch AS ( \
+            SELECT e.target_id AS nbr, e.source_id AS prim \
+              FROM p JOIN graph_edge e ON e.source_id = p.id \
+            UNION ALL \
+            SELECT e.source_id, e.target_id \
+              FROM p JOIN graph_edge e ON e.target_id = p.id \
+             WHERE NOT EXISTS (SELECT 1 FROM p p2 WHERE p2.id = e.source_id))";
+        let neighbours = if node_name_filter_operator == "OR" {
+            "SELECT nbr FROM touch"
         } else {
-            // AND: neighbor must be connected to every primary node.
-            let primary_count_param = format!("${}", node_names.len() + 2);
-            format!(
-                "neighbor_ids AS ( \
-                     SELECT nbr_id AS id FROM ( \
-                         SELECT CASE \
-                             WHEN e.source_id IN (SELECT id FROM primary_nodes) \
-                             THEN e.target_id ELSE e.source_id \
-                         END AS nbr_id, \
-                         CASE \
-                             WHEN e.source_id IN (SELECT id FROM primary_nodes) \
-                             THEN e.source_id ELSE e.target_id \
-                         END AS primary_id \
-                         FROM graph_edge e \
-                         WHERE e.source_id IN (SELECT id FROM primary_nodes) \
-                            OR e.target_id IN (SELECT id FROM primary_nodes) \
-                     ) sub \
-                     GROUP BY nbr_id \
-                     HAVING COUNT(DISTINCT primary_id) = {primary_count_param} \
-                 )"
-            )
+            "SELECT nbr FROM touch GROUP BY nbr HAVING count(DISTINCT prim) = $3"
         };
-
         let sql = format!(
-            "WITH primary_nodes AS ( \
-                 SELECT DISTINCT id FROM graph_node WHERE type = $1 AND name IN ({names_in}) \
-             ), \
-             {neighbor_cte}, \
-             all_ids AS ( \
-                 SELECT id FROM primary_nodes UNION SELECT id FROM neighbor_ids \
-             ) \
-             SELECT 'node' AS kind, n.id, n.name, n.type, n.properties, \
-                    NULL::text AS source_id, NULL::text AS target_id, \
-                    NULL::text AS relationship_name, NULL::jsonb AS edge_props \
-             FROM graph_node n WHERE n.id IN (SELECT id FROM all_ids) \
-             UNION ALL \
-             SELECT 'edge', NULL, NULL, NULL, NULL, \
-                    e.source_id, e.target_id, e.relationship_name, e.properties \
-             FROM graph_edge e \
-             WHERE e.source_id IN (SELECT id FROM all_ids) \
-               AND e.target_id IN (SELECT id FROM all_ids)"
+            "WITH p AS MATERIALIZED (SELECT DISTINCT id FROM graph_node \
+                                     WHERE type = $1 AND name = ANY($2::text[])), \
+             {touching}, \
+             ids AS MATERIALIZED (SELECT id FROM p UNION {neighbours}) \
+             {INDUCED_SUBGRAPH}"
         );
-
-        let mut values: Vec<sea_orm::Value> = Vec::new();
-        values.push(node_type.into());
-        for name in node_names {
-            values.push(name.clone().into());
-        }
+        let mut values: Vec<sea_orm::Value> = vec![node_type.into(), node_names.to_vec().into()];
         if node_name_filter_operator != "OR" {
-            values.push((node_names.len() as i64).into());
+            values.push(i64::try_from(node_names.len()).unwrap_or(i64::MAX).into());
         }
-
-        let rows = self
-            .db
-            .query_all(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                &sql,
-                values,
-            ))
-            .await
-            .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
-
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-
-        for row in &rows {
-            let kind: String = row.try_get("", "kind").unwrap_or_default();
-            if kind == "node" {
-                let data = Self::parse_node_row(row)?;
-                let id = data
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                nodes.push((id, data));
-            } else {
-                edges.push(Self::parse_edge_row_cols(
-                    row,
-                    "source_id",
-                    "target_id",
-                    "relationship_name",
-                    "edge_props",
-                )?);
-            }
-        }
-
-        Ok((nodes, edges))
+        self.subgraph_query(&sql, values).await
     }
 
     async fn get_id_filtered_graph_data(
@@ -1840,59 +1945,123 @@ impl GraphDBTrait for PgGraphAdapter {
         if node_ids.is_empty() {
             return Ok((vec![], vec![]));
         }
-
-        // Raw SQL — the edge query reuses the same $1..$N placeholders for both
-        // source_id IN and target_id IN, a PostgreSQL optimisation that sea_query
-        // cannot express.
-        let placeholders: Vec<String> = (1..=node_ids.len()).map(|i| format!("${i}")).collect();
-        let in_clause = placeholders.join(", ");
-
-        let node_sql =
-            format!("SELECT id, name, type, properties FROM graph_node WHERE id IN ({in_clause})");
-        let edge_sql = format!(
-            "SELECT source_id, target_id, relationship_name, properties FROM graph_edge \
-             WHERE source_id IN ({in_clause}) AND target_id IN ({in_clause})"
+        // One `text[]` parameter instead of the id list bound twice (once per
+        // edge endpoint), so no 65 535-parameter ceiling at ~32k ids.
+        let sql = format!(
+            "WITH ids AS MATERIALIZED (SELECT DISTINCT unnest($1::text[]) AS id) {INDUCED_SUBGRAPH}"
         );
+        self.subgraph_query(&sql, vec![node_ids.to_vec().into()])
+            .await
+    }
 
-        let values: Vec<sea_orm::Value> = node_ids.iter().map(|id| id.clone().into()).collect();
+    /// Nodes of `node_type` with exactly one incident edge (a self-loop
+    /// counts twice, as in the trait default), without loading the graph.
+    /// Each candidate probes the edge indexes and stops at the second hit, so
+    /// hubs cost no more than leaves.
+    async fn get_degree_one_nodes(&self, node_type: &str) -> GraphDBResult<Vec<GraphNode>> {
+        self.graph_nodes_where(
+            "SELECT n.id, n.name, n.type, n.properties FROM graph_node n \
+             WHERE n.type = $1 AND ( \
+               SELECT count(*) FROM ( \
+                 (SELECT 1 FROM graph_edge e WHERE e.source_id = n.id LIMIT 2) \
+                 UNION ALL \
+                 (SELECT 1 FROM graph_edge e WHERE e.target_id = n.id LIMIT 2) \
+               ) d) = 1",
+            vec![node_type.into()],
+        )
+        .await
+    }
 
-        let node_rows = self
+    async fn get_all_relationship_names(&self) -> GraphDBResult<HashSet<String>> {
+        let rows = self
             .db
-            .query_all(Statement::from_sql_and_values(
+            .query_all(Statement::from_string(
                 DatabaseBackend::Postgres,
-                &node_sql,
-                values.clone(),
+                "SELECT DISTINCT relationship_name FROM graph_edge".to_string(),
             ))
             .await
             .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
+        rows.iter()
+            .map(|r| {
+                r.try_get("", "relationship_name")
+                    .map_err(|e| GraphDBError::QueryError(e.to_string()))
+            })
+            .collect()
+    }
 
-        let mut nodes = Vec::new();
-        for row in &node_rows {
-            let data = Self::parse_node_row(row)?;
-            let id = data
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            nodes.push((id, data));
+    /// `EdgeType` nodes with no incident edge whose `relationship_name`
+    /// property (default "") names no edge — the trait default's predicate,
+    /// evaluated in SQL instead of over the loaded graph.
+    async fn get_zero_degree_edge_type_nodes(&self) -> GraphDBResult<Vec<GraphNode>> {
+        self.graph_nodes_where(
+            "SELECT n.id, n.name, n.type, n.properties FROM graph_node n \
+             WHERE n.type = 'EdgeType' \
+               AND NOT EXISTS (SELECT 1 FROM graph_edge e WHERE e.source_id = n.id) \
+               AND NOT EXISTS (SELECT 1 FROM graph_edge e WHERE e.target_id = n.id) \
+               AND NOT EXISTS (SELECT 1 FROM graph_edge e WHERE e.relationship_name = \
+                   CASE WHEN jsonb_typeof(n.properties->'relationship_name') = 'string' \
+                        THEN n.properties->>'relationship_name' ELSE '' END)",
+            vec![],
+        )
+        .await
+    }
+
+    /// The seeds' `depth`-hop neighbourhood: every node within `depth`
+    /// undirected hops and every edge whose endpoints are both in that set
+    /// (stored direction preserved).
+    ///
+    /// Depth 0 and 1 are one statement: the id set is a CTE built from two
+    /// directed index joins (no `source = x OR target = x` join, which can
+    /// only be answered by a bitmap-OR per row of the recursive CTE), and the
+    /// induced edges come from index scans on `source_id` joined against the
+    /// set. Deeper walks expand the frontier level by level (one round trip
+    /// each, never revisiting a node) and then read the induced subgraph.
+    /// With a per-seed neighbour cap at depth 1 the cap is applied in the
+    /// query: each seed's non-seed neighbours are read from the edge indexes
+    /// (a `LATERAL` per seed) and only the `cap` smallest ids (`COLLATE "C"`,
+    /// i.e. byte order, as the trait default sorts) join the id set, so the
+    /// hub fan-out never reaches the induced-subgraph join. Property
+    /// narrowing, if any, is then applied client-side.
+    async fn get_neighborhood_scoped(
+        &self,
+        node_ids: &[String],
+        depth: usize,
+        scope: &NeighborhoodScope,
+    ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+        let (Some(cap), 1) = (scope.max_neighbors_per_seed, depth) else {
+            let (nodes, edges) = self.get_neighborhood(node_ids, depth).await?;
+            return Ok(apply_neighborhood_scope(
+                node_ids, depth, nodes, edges, scope,
+            ));
+        };
+        if node_ids.is_empty() {
+            return Ok((vec![], vec![]));
         }
-
-        let edge_rows = self
-            .db
-            .query_all(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                &edge_sql,
-                values,
-            ))
-            .await
-            .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
-
-        let mut edges = Vec::new();
-        for row in &edge_rows {
-            edges.push(Self::parse_edge_row(row)?);
-        }
-
-        Ok((nodes, edges))
+        let induced = if node_ids.len() >= SEMI_JOIN_MIN_SEEDS {
+            INDUCED_SUBGRAPH_SEMI
+        } else {
+            INDUCED_SUBGRAPH
+        };
+        let sql = format!(
+            "WITH seeds AS MATERIALIZED (SELECT DISTINCT unnest($1::text[]) AS id), \
+             nb AS (SELECT c.nbr FROM seeds s CROSS JOIN LATERAL ( \
+                 SELECT u.nbr FROM ( \
+                     SELECT e.target_id AS nbr FROM graph_edge e WHERE e.source_id = s.id \
+                     UNION SELECT e.source_id FROM graph_edge e WHERE e.target_id = s.id) u \
+                 WHERE NOT EXISTS (SELECT 1 FROM seeds s2 WHERE s2.id = u.nbr) \
+                 ORDER BY u.nbr COLLATE \"C\" LIMIT {cap}) c), \
+             ids AS MATERIALIZED (SELECT id FROM seeds UNION SELECT nbr FROM nb) {induced}"
+        );
+        let (nodes, edges) = self
+            .subgraph_query(&sql, vec![node_ids.to_vec().into()])
+            .await?;
+        let rest = NeighborhoodScope {
+            max_neighbors_per_seed: None,
+            ..scope.clone()
+        };
+        Ok(apply_neighborhood_scope(
+            node_ids, depth, nodes, edges, &rest,
+        ))
     }
 
     async fn get_neighborhood(
@@ -1903,69 +2072,245 @@ impl GraphDBTrait for PgGraphAdapter {
         if node_ids.is_empty() {
             return Ok((vec![], vec![]));
         }
+        let ids: Vec<String> = if depth <= 1 {
+            node_ids.to_vec()
+        } else {
+            let mut seen: HashSet<String> = node_ids.iter().cloned().collect();
+            let mut frontier: Vec<String> = seen.iter().cloned().collect();
+            for _ in 0..depth - 1 {
+                if frontier.is_empty() {
+                    break;
+                }
+                let rows = self
+                    .query_all_tuned(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "WITH f AS (SELECT DISTINCT unnest($1::text[]) AS id) \
+                         SELECT e.target_id AS id FROM graph_edge e JOIN f ON e.source_id = f.id \
+                         UNION SELECT e.source_id FROM graph_edge e JOIN f ON e.target_id = f.id",
+                        [frontier.clone().into()],
+                    ))
+                    .await
+                    .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
+                let mut next = Vec::new();
+                for row in &rows {
+                    let id: String = row
+                        .try_get("", "id")
+                        .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
+                    if seen.insert(id.clone()) {
+                        next.push(id);
+                    }
+                }
+                frontier = next;
+            }
+            seen.into_iter().collect()
+        };
+        // For depth >= 1 the final statement adds the last hop itself.
+        let expand = if depth == 0 {
+            ""
+        } else {
+            "UNION SELECT e.target_id FROM graph_edge e JOIN seeds s ON e.source_id = s.id \
+             UNION SELECT e.source_id FROM graph_edge e JOIN seeds s ON e.target_id = s.id"
+        };
+        let induced = if ids.len() >= SEMI_JOIN_MIN_SEEDS {
+            INDUCED_SUBGRAPH_SEMI
+        } else {
+            INDUCED_SUBGRAPH
+        };
+        let sql = format!(
+            "WITH seeds AS (SELECT DISTINCT unnest($1::text[]) AS id), \
+             ids AS MATERIALIZED (SELECT id FROM seeds {expand}) {induced}"
+        );
+        self.subgraph_query(&sql, vec![ids.into()]).await
+    }
+}
 
-        // Single recursive-CTE round trip: expand the seed set out to `depth`
-        // hops, then return both the node rows and the edges internal to the
-        // resolved set. `ge.source_id`/`ge.target_id` are selected straight off
-        // graph_edge (no CASE swap), so the true stored direction is preserved.
-        // The two result halves are discriminated by a literal `kind` column;
-        // the edge half's properties are aliased `edge_properties` to avoid a
-        // collision with the node half's `properties` column.
-        let sql = "WITH RECURSIVE neighborhood(id, hops) AS ( \
-                       SELECT unnest($1::text[]), 0 \
-                       UNION \
-                       SELECT CASE WHEN e.source_id = n.id THEN e.target_id ELSE e.source_id END, \
-                              n.hops + 1 \
-                       FROM neighborhood n \
-                       JOIN graph_edge e ON (e.source_id = n.id OR e.target_id = n.id) \
-                       WHERE n.hops < $2 \
-                   ), \
-                   ids AS (SELECT DISTINCT id FROM neighborhood) \
-                   SELECT 'node' AS kind, gn.id, gn.name, gn.type, gn.properties, \
-                          NULL::text AS source_id, NULL::text AS target_id, \
-                          NULL::text AS relationship_name, NULL::jsonb AS edge_properties \
-                   FROM graph_node gn WHERE gn.id IN (SELECT id FROM ids) \
-                   UNION ALL \
-                   SELECT 'edge', NULL, NULL, NULL, NULL, \
-                          ge.source_id, ge.target_id, ge.relationship_name, ge.properties \
-                   FROM graph_edge ge \
-                   WHERE ge.source_id IN (SELECT id FROM ids) \
-                     AND ge.target_id IN (SELECT id FROM ids)";
+// ---------------------------------------------------------------------------
+// Connected components (streaming union-find)
+// ---------------------------------------------------------------------------
 
-        let rows = self
-            .db
-            .query_all(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                sql,
-                [node_ids.to_vec().into(), (depth as i64).into()],
-            ))
-            .await
-            .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
+/// Connected components by streaming union-find: node and edge keys are
+/// streamed once and unioned client-side, O(V + E) time and O(V) memory.
+///
+/// The two scans run in one `REPEATABLE READ` read-only transaction, so they
+/// see the same snapshot. They have to: an edge whose endpoints are not both in
+/// the node index is silently skipped (`if let (Some(&a), Some(&b))`, there for
+/// the foreign keys that make it impossible), and under the default
+/// `READ COMMITTED` each statement takes a *fresh* snapshot — so a node
+/// inserted between the passes makes its edges invisible to the index and the
+/// components it joined come apart. Wrapping the two statements in a plain
+/// `begin()` would not have been enough for the same reason.
+///
+/// Consistency stops at this pass: `node_count` and `edge_count` are separate
+/// statements outside it, so on a graph being written concurrently the
+/// component sizes can still sum to less than the reported `node_count`.
+///
+/// Keys travel as 64-bit `hashtextextended` values (16 bytes per edge instead
+/// of two text ids); a hash collision among node ids is detected while
+/// building the index, and the pass is then redone with the ids themselves.
+mod components {
+    use std::collections::HashMap;
+    use std::collections::hash_map::Entry;
+    use std::hash::Hash;
 
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-        for row in &rows {
-            let kind: String = row.try_get("", "kind").unwrap_or_default();
-            if kind == "node" {
-                let data = Self::parse_node_row(row)?;
-                let id = data
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                nodes.push((id, data));
-            } else {
-                edges.push(Self::parse_edge_row_cols(
-                    row,
-                    "source_id",
-                    "target_id",
-                    "relationship_name",
-                    "edge_properties",
-                )?);
+    use futures::TryStreamExt;
+    use sea_orm::{
+        AccessMode, DatabaseBackend, DatabaseConnection, DatabaseTransaction, IsolationLevel,
+        Statement, StreamTrait, TransactionTrait, TryGetable,
+    };
+
+    use crate::error::{GraphDBError, GraphDBResult};
+
+    struct UnionFind {
+        parent: Vec<u32>,
+        size: Vec<u32>,
+    }
+
+    impl UnionFind {
+        fn new(n: u32) -> Self {
+            Self {
+                parent: (0..n).collect(),
+                size: vec![1; n as usize],
             }
         }
 
-        Ok((nodes, edges))
+        fn find(&mut self, mut x: u32) -> u32 {
+            while self.parent[x as usize] != x {
+                let p = self.parent[x as usize];
+                self.parent[x as usize] = self.parent[p as usize];
+                x = p;
+            }
+            x
+        }
+
+        fn union(&mut self, a: u32, b: u32) {
+            let (mut ra, mut rb) = (self.find(a), self.find(b));
+            if ra == rb {
+                return;
+            }
+            if self.size[ra as usize] < self.size[rb as usize] {
+                std::mem::swap(&mut ra, &mut rb);
+            }
+            self.parent[rb as usize] = ra;
+            self.size[ra as usize] += self.size[rb as usize];
+        }
+    }
+
+    fn scan_err(e: impl std::fmt::Display) -> GraphDBError {
+        GraphDBError::QueryError(format!("connected-components scan failed: {e}"))
+    }
+
+    /// Component sizes, largest first; `None` if two node keys collided.
+    async fn sizes_by<K>(
+        db: &DatabaseTransaction,
+        node_sql: &str,
+        edge_sql: &str,
+    ) -> GraphDBResult<Option<Vec<i64>>>
+    where
+        K: TryGetable + Eq + Hash,
+    {
+        let mut index: HashMap<K, u32> = HashMap::new();
+        {
+            let mut nodes = db
+                .stream(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    node_sql.to_string(),
+                ))
+                .await
+                .map_err(scan_err)?;
+            while let Some(row) = nodes.try_next().await.map_err(scan_err)? {
+                let key: K = row.try_get("", "k").map_err(scan_err)?;
+                let next = u32::try_from(index.len()).map_err(scan_err)?;
+                match index.entry(key) {
+                    Entry::Occupied(_) => return Ok(None),
+                    Entry::Vacant(v) => {
+                        v.insert(next);
+                    }
+                }
+            }
+        }
+        let n = u32::try_from(index.len()).map_err(scan_err)?;
+        let mut uf = UnionFind::new(n);
+        {
+            let mut edges = db
+                .stream(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    edge_sql.to_string(),
+                ))
+                .await
+                .map_err(scan_err)?;
+            while let Some(row) = edges.try_next().await.map_err(scan_err)? {
+                let s: K = row.try_get("", "s").map_err(scan_err)?;
+                let t: K = row.try_get("", "t").map_err(scan_err)?;
+                // Endpoints always exist (foreign keys); skip defensively.
+                if let (Some(&a), Some(&b)) = (index.get(&s), index.get(&t)) {
+                    uf.union(a, b);
+                }
+            }
+        }
+        let mut sizes: Vec<i64> = Vec::new();
+        for i in 0..n {
+            if uf.find(i) == i {
+                sizes.push(i64::from(uf.size[i as usize]));
+            }
+        }
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(Some(sizes))
+    }
+
+    /// Sizes of the connected components of the (undirected) graph, largest
+    /// first — the recursive-CTE query's `ORDER BY sz DESC` result.
+    pub(super) async fn component_sizes(db: &DatabaseConnection) -> GraphDBResult<Vec<i64>> {
+        if let Some(sizes) = sizes_in_snapshot::<i64>(
+            db,
+            "SELECT hashtextextended(id, 0) AS k FROM graph_node",
+            "SELECT hashtextextended(source_id, 0) AS s, \
+                    hashtextextended(target_id, 0) AS t FROM graph_edge",
+        )
+        .await?
+        {
+            return Ok(sizes);
+        }
+        // The hash pass found a collision among the node ids; redo it on the
+        // ids themselves, in a snapshot of its own — it is a fresh read either
+        // way, and the first snapshot has already been given back.
+        sizes_in_snapshot::<String>(
+            db,
+            "SELECT id AS k FROM graph_node",
+            "SELECT source_id AS s, target_id AS t FROM graph_edge",
+        )
+        .await?
+        .ok_or_else(|| GraphDBError::QueryError("duplicate graph_node ids".to_string()))
+    }
+
+    /// [`sizes_by`] with both of its scans inside one `REPEATABLE READ`,
+    /// read-only transaction, so they see the same snapshot.
+    ///
+    /// Read-only is not decoration: it tells Postgres this transaction can
+    /// never take a write lock or hit a serialization failure, so holding a
+    /// snapshot across two full table scans costs nothing but the vacuum
+    /// horizon for the duration.
+    async fn sizes_in_snapshot<K>(
+        db: &DatabaseConnection,
+        node_sql: &str,
+        edge_sql: &str,
+    ) -> GraphDBResult<Option<Vec<i64>>>
+    where
+        K: TryGetable + Eq + Hash,
+    {
+        let txn = db
+            .begin_with_config(
+                Some(IsolationLevel::RepeatableRead),
+                Some(AccessMode::ReadOnly),
+            )
+            .await
+            .map_err(scan_err)?;
+        let out = sizes_by::<K>(&txn, node_sql, edge_sql).await;
+        // Releasing a read-only snapshot, not undoing anything: a failure here
+        // must not turn a good answer into an error.
+        if let Err(e) = txn.rollback().await {
+            tracing::debug!("connected-components snapshot rollback failed: {e}");
+        }
+        out
     }
 }
 
@@ -1991,7 +2336,70 @@ mod migrator {
         }
 
         fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-            vec![Box::new(CreateGraphTables)]
+            vec![Box::new(CreateGraphTables), Box::new(GraphAutovacuum)]
+        }
+    }
+
+    /// Per-table autovacuum thresholds for the graph tables: the server
+    /// defaults (vacuum at 20% dead, analyze at 10% changed) leave a table
+    /// that grows by cognify batches with stale statistics for most of a
+    /// load, and a `graph_edge` of 500k rows accumulates 100k dead tuples
+    /// before a vacuum. Reloptions only — no server setting is touched.
+    ///
+    /// # This migration sets the adapter's PostgreSQL floor at 13
+    /// `autovacuum_vacuum_insert_scale_factor` is the storage parameter for
+    /// insert-triggered vacuuming, which arrived in PostgreSQL 13 ("Allow
+    /// inserts, not only updates and deletes, to trigger vacuuming activity in
+    /// autovacuum … the new parameters `autovacuum_vacuum_insert_threshold` and
+    /// `autovacuum_vacuum_insert_scale_factor`, or the equivalent table storage
+    /// options" — PostgreSQL 13 release notes; the parameter is absent from the
+    /// 12 `CREATE TABLE` storage-parameter list and present in the 13 one).
+    ///
+    /// PostgreSQL rejects an unrecognized reloption rather than ignoring it, so
+    /// on 12 or older this `ALTER TABLE` is an error, the migration fails, and
+    /// both constructors refuse to initialise — a hard break, not a degraded
+    /// mode. That is accepted rather than worked around: 12 reached end of life
+    /// in November 2024, and `DO … EXCEPTION WHEN invalid_parameter_value` would
+    /// swallow a genuine misconfiguration to keep a dead release working. What
+    /// is *not* accepted is leaving it undocumented, which is why the floor is
+    /// stated here and in `docs/tools/backends.md`.
+    ///
+    /// Note that it is this migration alone, not the rest of the adapter:
+    /// `plan_cache_mode` (see [`PLAN_CACHE_LOCAL`]) is 12+, and the tables and
+    /// queries themselves go back further.
+    struct GraphAutovacuum;
+
+    impl MigrationName for GraphAutovacuum {
+        fn name(&self) -> &str {
+            "m20250930_000002_graph_autovacuum"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MigrationTrait for GraphAutovacuum {
+        async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+            let conn = manager.get_connection();
+            for t in ["graph_node", "graph_edge"] {
+                conn.execute_unprepared(&format!(
+                    "ALTER TABLE {t} SET (autovacuum_vacuum_scale_factor = 0.05, \
+                     autovacuum_vacuum_insert_scale_factor = 0.05, \
+                     autovacuum_analyze_scale_factor = 0.02)"
+                ))
+                .await?;
+            }
+            Ok(())
+        }
+
+        async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+            let conn = manager.get_connection();
+            for t in ["graph_node", "graph_edge"] {
+                conn.execute_unprepared(&format!(
+                    "ALTER TABLE {t} RESET (autovacuum_vacuum_scale_factor, \
+                     autovacuum_vacuum_insert_scale_factor, autovacuum_analyze_scale_factor)"
+                ))
+                .await?;
+            }
+            Ok(())
         }
     }
 
@@ -2009,11 +2417,22 @@ mod migrator {
             let conn = manager.get_connection();
 
             // -- graph_node table --
+            //
+            // Key columns use the "C" collation: they are only ever compared
+            // for equality (ids are UUIDs / normalized identifiers, `type` and
+            // `relationship_name` are labels), and every btree insert, lookup,
+            // FK check and merge join on them otherwise goes through the
+            // database's locale collation (`strcoll`). Measured on a 10k-node
+            // store: 30.8k edge inserts 685 ms -> 382 ms, 8k node inserts
+            // 75 ms -> 37 ms. Equality semantics are identical (both are
+            // deterministic), so queries and other SDKs are unaffected; this
+            // applies to newly created tables only (`IF NOT EXISTS`), existing
+            // ones keep their collation.
             conn.execute_unprepared(
                 "CREATE TABLE IF NOT EXISTS graph_node ( \
-                     id         VARCHAR PRIMARY KEY, \
+                     id         VARCHAR COLLATE \"C\" PRIMARY KEY, \
                      name       VARCHAR NOT NULL DEFAULT '', \
-                     type       VARCHAR NOT NULL DEFAULT '', \
+                     type       VARCHAR COLLATE \"C\" NOT NULL DEFAULT '', \
                      properties JSONB NOT NULL DEFAULT '{}', \
                      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
                      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
@@ -2029,9 +2448,9 @@ mod migrator {
             // -- graph_edge table --
             conn.execute_unprepared(
                 "CREATE TABLE IF NOT EXISTS graph_edge ( \
-                     source_id         VARCHAR NOT NULL REFERENCES graph_node(id) ON DELETE CASCADE, \
-                     target_id         VARCHAR NOT NULL REFERENCES graph_node(id) ON DELETE CASCADE, \
-                     relationship_name VARCHAR NOT NULL, \
+                     source_id         VARCHAR COLLATE \"C\" NOT NULL REFERENCES graph_node(id) ON DELETE CASCADE, \
+                     target_id         VARCHAR COLLATE \"C\" NOT NULL REFERENCES graph_node(id) ON DELETE CASCADE, \
+                     relationship_name VARCHAR COLLATE \"C\" NOT NULL, \
                      properties        JSONB NOT NULL DEFAULT '{}', \
                      created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
                      updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
@@ -2040,13 +2459,13 @@ mod migrator {
             )
             .await?;
 
-            // Covering indexes for efficient neighbor lookups without heap reads.
-            conn.execute_unprepared(
-                "CREATE INDEX IF NOT EXISTS idx_graph_edge_source_cover \
-                 ON graph_edge(source_id) INCLUDE (target_id, relationship_name)",
-            )
-            .await?;
-
+            // Covering index for target-side neighbour lookups without heap
+            // reads. Source-side lookups need none: the primary key
+            // `(source_id, target_id, relationship_name)` already answers
+            // `source_id = x` with an index-only scan returning both other
+            // columns, so the former `idx_graph_edge_source_cover` duplicated
+            // it and only cost every edge write a fourth btree insert. Tables
+            // that already carry it keep it (harmless).
             conn.execute_unprepared(
                 "CREATE INDEX IF NOT EXISTS idx_graph_edge_target_cover \
                  ON graph_edge(target_id) INCLUDE (source_id, relationship_name)",
@@ -2113,7 +2532,9 @@ mod shared_db_migration_tests {
     /// `JoinError` instead of unwinding past the drop. `TempPostgresDb::cleanup`
     /// is `async`, so it cannot be a `Drop` impl; without this the database would
     /// leak on every red run. The panic is re-raised unchanged afterwards.
-    async fn with_temp_db<F, Fut>(what: &str, body: F)
+    /// `pub(super)` only so the sibling `session_tuning_tests` module can reuse
+    /// it rather than copy it; nothing outside the test modules can see it.
+    pub(super) async fn with_temp_db<F, Fut>(what: &str, body: F)
     where
         F: FnOnce(String) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -2249,10 +2670,18 @@ mod shared_db_migration_tests {
                 adapter.err()
             );
 
-            // 3. The graph migrator tracks its version in its OWN table and leaves
-            //    the relational bookkeeping untouched.
+            // 3. The graph migrator tracks its versions in its OWN table and
+            //    leaves the relational bookkeeping untouched. The expected count
+            //    is read off the migrator's own list rather than written out, so
+            //    adding a graph migration cannot make this assertion stale.
             assert_eq!(version_count(&db, "seaql_migrations").await, 2);
-            assert_eq!(version_count(&db, "seaql_migrations_pggraph").await, 1);
+            assert_eq!(
+                version_count(&db, "seaql_migrations_pggraph").await,
+                // Fully qualified: `sea_orm_migration::prelude::*` brings a
+                // `ValueType::try_from` for `i64` into scope too.
+                <i64 as TryFrom<usize>>::try_from(super::migrator::Migrator::migrations().len())
+                    .unwrap(),
+            );
         })
         .await;
     }
@@ -2368,5 +2797,153 @@ mod sanitize_tests {
             row.properties["text"],
             json!("no nulls — just an em dash and 日本語")
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session-tuning tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test code — panics are acceptable failures"
+)]
+mod session_tuning_tests {
+    use super::shared_db_migration_tests::with_temp_db;
+    use super::{PLAN_CACHE_LOCAL, PgGraphAdapter};
+    use crate::traits::GraphDBTrait;
+    use sea_orm::{
+        ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Statement,
+    };
+    use serde_json::json;
+
+    /// The decision itself, with no server: a pool this adapter opened carries
+    /// the setting in its connection options and must not pay a transaction to
+    /// repeat it; one it did not open has no such hook and every parameterised
+    /// statement has to bring it.
+    #[test]
+    fn only_a_caller_owned_connection_carries_the_setting_per_statement() {
+        assert_eq!(PgGraphAdapter::tuned_locals(true), None);
+        assert_eq!(
+            PgGraphAdapter::tuned_locals(false),
+            Some(PLAN_CACHE_LOCAL),
+            "from_connection has no ConnectOptions hook, so the statements must \
+             carry what new()'s pool gets as an option"
+        );
+    }
+
+    /// What only a server can answer: that the `SET LOCAL` is accepted and in
+    /// force for the statement, that it does not outlive it, and that every
+    /// parameterised path still works now that it runs inside a transaction.
+    ///
+    /// The caller's pool is capped at one connection so the leak check is exact
+    /// rather than probabilistic — a plain `SET` would leak to the next borrower
+    /// of that connection, which in the single-shared-Postgres layout is the
+    /// relational store's own queries.
+    #[tokio::test]
+    async fn a_caller_owned_connection_runs_its_statements_with_a_custom_plan() {
+        with_temp_db(
+            "a_caller_owned_connection_runs_its_statements_with_a_custom_plan",
+            |url| async move {
+                let mut opts = ConnectOptions::new(url.clone());
+                opts.max_connections(1);
+                let caller_pool: DatabaseConnection = Database::connect(opts).await.unwrap();
+                let shared = PgGraphAdapter::from_connection(caller_pool.clone())
+                    .await
+                    .unwrap();
+                assert!(
+                    !shared.tuned_sessions,
+                    "from_connection wraps a pool whose options it never chose"
+                );
+
+                // In force for the statement — read back through the adapter's
+                // own helper, on a statement that actually has a parameter.
+                let row = shared
+                    .query_one_tuned(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "SELECT current_setting('plan_cache_mode') AS pc, $1::text AS echo",
+                        ["probe".into()],
+                    ))
+                    .await
+                    .unwrap()
+                    .expect("one row");
+                assert_eq!(
+                    row.try_get::<String>("", "pc").unwrap(),
+                    "force_custom_plan",
+                    "without this the generic plan cannot see a bound id array \
+                     and costs a neighbourhood read like any other — 10.9 ms \
+                     against 1.2 ms, per new()'s measurement"
+                );
+                assert_eq!(row.try_get::<String>("", "echo").unwrap(), "probe");
+
+                // And gone again: the caller's next query on that same, single
+                // connection must see the server default.
+                let after = caller_pool
+                    .query_one(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT current_setting('plan_cache_mode') AS pc".to_string(),
+                    ))
+                    .await
+                    .unwrap()
+                    .expect("one row");
+                assert_eq!(
+                    after.try_get::<String>("", "pc").unwrap(),
+                    "auto",
+                    "a setting that outlives its statement leaks to whatever \
+                     borrows this pooled connection next"
+                );
+
+                // An owned pool keeps the plain single-statement path, and gets
+                // the same setting from its connection options.
+                let owned = PgGraphAdapter::new(&url).await.unwrap();
+                assert!(owned.tuned_sessions);
+                assert_eq!(
+                    owned
+                        .query_one_tuned(Statement::from_sql_and_values(
+                            DatabaseBackend::Postgres,
+                            "SELECT current_setting('plan_cache_mode') AS pc, $1::text AS echo",
+                            ["probe".into()],
+                        ))
+                        .await
+                        .unwrap()
+                        .expect("one row")
+                        .try_get::<String>("", "pc")
+                        .unwrap(),
+                    "force_custom_plan"
+                );
+
+                // Every kind of parameterised statement still answers now that
+                // it runs inside a transaction: an array read, an `unnest`
+                // insert, a single-row read, an edge read and an `ANY` delete.
+                shared
+                    .add_nodes_raw(vec![
+                        json!({"id": "a", "name": "A", "type": "Entity"}),
+                        json!({"id": "b", "name": "B", "type": "Entity"}),
+                    ])
+                    .await
+                    .unwrap();
+                shared.add_edge("a", "b", "knows", None).await.unwrap();
+                assert!(shared.has_node("a").await.unwrap());
+                assert_eq!(
+                    shared
+                        .get_nodes(&["a".to_string(), "b".to_string()])
+                        .await
+                        .unwrap()
+                        .len(),
+                    2
+                );
+                assert!(shared.get_node("a").await.unwrap().is_some());
+                assert_eq!(shared.get_edges("a").await.unwrap().len(), 1);
+                assert_eq!(shared.get_neighbors("a").await.unwrap().len(), 1);
+                shared.delete_nodes(&["a".to_string()]).await.unwrap();
+                assert!(!shared.has_node("a").await.unwrap());
+
+                owned.close().await.unwrap();
+                drop(shared);
+                caller_pool.close().await.unwrap();
+            },
+        )
+        .await;
     }
 }

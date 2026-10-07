@@ -48,7 +48,7 @@ use cognee_models::{
 use cognee_ontology::OntologyResolver;
 use cognee_storage::StorageTrait;
 use cognee_utils::sanitize::{sanitize_str, sanitize_string};
-use cognee_vector::{VectorDB, VectorPoint};
+use cognee_vector::{BulkLoadGuard, VectorDB, VectorPoint};
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::json;
@@ -4323,9 +4323,35 @@ pub async fn cognify(
         // read it from — and a sweep with no run to select on would silently
         // remove nothing.
         let watcher = rollback::RunIdCapturingWatcher::new(Arc::clone(&pipeline_run_repo));
+        // One cognify run is one bulk load for the vector store: a backend
+        // may defer per-row ANN index maintenance until the scope ends. The
+        // hint never changes results, so a failure to open or close the scope
+        // is logged, not returned (the rows are written either way).
+        //
+        // Held as a `BulkLoadGuard` rather than a `begin` / `end` pair around
+        // the await, because this future does not always run to completion:
+        // an HTTP caller can disconnect, a caller can wrap the run in
+        // `tokio::time::timeout` or race it in a `select!`, and a panic in the
+        // executor unwinds straight past a trailing statement. A missed close
+        // leaves a counting backend's scope depth above zero forever, and from
+        // then on every collection it defers loses its ANN index permanently.
+        // The guard's `Drop` closes the scope synchronously on those paths and
+        // leaves the deferred maintenance to the next load or to `close()`.
+        let bulk = match BulkLoadGuard::begin(vector_db.as_ref()).await {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                warn!(error = %e, "cognify: vector store rejected the bulk-load scope");
+                None
+            }
+        };
         let executed = cognee_core::pipeline::execute(&pipeline, inputs, ctx, &watcher)
             .await
             .map_err(unwrap_execution_error);
+        if let Some(bulk) = bulk
+            && let Err(e) = bulk.finish().await
+        {
+            warn!(error = %e, "cognify: vector store failed to finish its bulk load");
+        }
 
         // ── The policy layer ────────────────────────────────────────────────
         // Everything from here on is `rollback`'s decision: which scope to

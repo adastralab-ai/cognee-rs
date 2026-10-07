@@ -21,7 +21,7 @@ workspace = true
 # `cognee-http-server` and every binding enable it in their own defaults, so a
 # plain build of those is unchanged.
 lancedb  = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema", "dep:futures"]
-pgvector = ["dep:sea-orm", "dep:sea-orm-migration"]
+pgvector = ["dep:sea-orm", "dep:sea-orm-migration", "dep:futures-util"]
 testing  = []
 
 [dependencies]
@@ -35,10 +35,15 @@ sea-orm = { version = "1.1", features = [
     "sqlx-postgres",
     "with-uuid",
     "with-json",
+    # Binds `Vec<f32>` / `Vec<Uuid>` / `Vec<String>` as `real[]` / `uuid[]` /
+    # `text[]` parameters (bulk upserts, `= ANY($1)` id lists).
+    "postgres-array",
 ], optional = true }
 sea-orm-migration = { version = "1.1", features = [
     "runtime-tokio-rustls",
 ], optional = true }
+# Concurrent upsert statements (`buffer_unordered`) in the pgvector adapter.
+futures-util = { workspace = true, optional = true }
 
 # Data structures
 uuid = { workspace = true }
