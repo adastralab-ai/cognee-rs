@@ -156,7 +156,27 @@ void cg_pipeline_destroy(CgPipeline* p);
  *
  * The pipeline handle may be destroyed with cg_pipeline_destroy() as
  * soon as the execute call returns — the Arc-shared task list keeps the
- * tasks alive for the duration of the background/async run. */
+ * tasks alive for the duration of the background/async run. The same holds
+ * for the watcher (NULL = no-op): a background/async run keeps its own
+ * reference, so cg_pipeline_watcher_destroy() may be called right away.
+ * The vtable's destroy fires when the last reference goes: if the handle
+ * was destroyed while the run was in flight, that is when the run is done,
+ * before the completion callback; otherwise it is the destroy call itself. In those two modes watcher callbacks — destroy included — run
+ * on runtime worker threads, not the caller's, and may run concurrently
+ * (pipeline concurrency > 1, or one watcher shared by several runs), so
+ * watcher state must be thread-safe and callbacks must not block or call
+ * blocking cg_* entry points.
+ *
+ * While a run is in flight (any mode), the cg_pipeline_set_* and
+ * cg_pipeline_add_task calls on that pipeline are refused: they become
+ * no-ops and set cg_last_error_message() (add_task and set_data_id_fn
+ * still take ownership of their argument and free it). As with every
+ * entry point, the error is sticky — call cg_last_error_clear() first to
+ * detect a refusal. The pipeline is mutable again once the run is done:
+ * when the blocking call returns, or when the completion callback
+ * (cg_run_handle_wait / cg_pipeline_execute_async) fires. A background run
+ * detached with cg_run_handle_destroy, or aborted, keeps the pipeline until
+ * its task actually stops. */
 typedef void (*CgExecutionCallback)(CgErrorCode, CgPipelineRunResult*, void*);
 CgErrorCode cg_pipeline_execute_blocking(const CgPipeline*, const CgValue* const*, size_t, const CgTaskContext*, const CgPipelineWatcher*, CgPipelineRunResult**);
 CgPipelineRunHandle* cg_pipeline_execute_in_background(const CgPipeline*, const CgValue* const*, size_t, const CgTaskContext*, const CgPipelineWatcher*);
